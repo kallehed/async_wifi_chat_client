@@ -1,12 +1,12 @@
-use std::time::Duration;
+use std::collections::HashSet;
+use std::net::IpAddr;
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::{sync::atomic::Ordering, time::Duration};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpListener,
 };
-use std::sync::Mutex;
-use std::sync::Arc;
-use std::collections::HashSet;
-use std::net::IpAddr;
 
 const PORT: u16 = 2000;
 const LISTEN_ADDRESS: &str = "127.0.0.1";
@@ -15,21 +15,25 @@ type StdinMsg = [u8; 32];
 
 const LISTEN_SOCKET: (&str, u16) = (LISTEN_ADDRESS, PORT);
 
+static IN_CONNECTION: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tokio::spawn(broadcast_existance());
     let peers = Arc::new(Mutex::new(HashSet::new()));
     tokio::spawn(listen_for_peers(peers.clone()));
+    tokio::spawn(print_available_peers(peers.clone()));
 
     let (stdin_watch_sender, stdin_watch_receiver) = tokio::sync::watch::channel([0; 32]);
-
 
     tokio::spawn(async move {
         stdin_listener(stdin_watch_sender).await.unwrap();
     });
     let stdin_watch_receiver_clone = stdin_watch_receiver.clone();
     tokio::spawn(async move {
-        tcp_connection_listener(stdin_watch_receiver_clone).await.unwrap();
+        tcp_connection_listener(stdin_watch_receiver_clone)
+            .await
+            .unwrap();
     });
     tokio::spawn(async move {
         tcp_connection_creator(stdin_watch_receiver, peers.clone()).await;
@@ -37,20 +41,44 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     loop {}
 }
 
-async fn tcp_connection_creator(mut stdin_watch_receiver: tokio::sync::watch::Receiver<StdinMsg>, peers: Arc<Mutex<HashSet<IpAddr>>>) {
+async fn print_available_peers(peers: Arc<Mutex<HashSet<IpAddr>>>) {
+    let mut interval = tokio::time::interval(Duration::from_millis(1500));
+    loop {
+        interval.tick().await;
+        // only print this info when not in connection
+        if IN_CONNECTION.load(Ordering::Relaxed) {
+            continue;
+        }
+        println!("Peers Available:");
+        {
+            let set = peers.lock().unwrap();
+            for (idx, elem) in set.iter().enumerate() {
+                println!("  {}: {:?}", idx, elem);
+            }
+        }
+    }
+}
+
+async fn tcp_connection_creator(
+    mut stdin_watch_receiver: tokio::sync::watch::Receiver<StdinMsg>,
+    peers: Arc<Mutex<HashSet<IpAddr>>>,
+) {
     loop {
         stdin_watch_receiver.changed().await.unwrap();
         let num = {
             let inp = &*stdin_watch_receiver.borrow_and_update();
             // turn u8's into utf8
-            let len = inp.iter().position(|&item| item == b'\n').unwrap_or(inp.len());
+            let len = inp
+                .iter()
+                .position(|&item| item == b'\n')
+                .unwrap_or(inp.len());
             let inp = &inp[..len];
             let inp = std::str::from_utf8(inp).unwrap_or("ERRENOUS UTF8");
             println!("you just said: {:?}", inp);
             let Ok(num) = inp.parse::<u16>() else {
                 println!("ERROR: {:?} is not a number", inp);
                 continue;
-            }; 
+            };
             num
         };
         let peer = {
@@ -67,9 +95,14 @@ async fn tcp_connection_creator(mut stdin_watch_receiver: tokio::sync::watch::Re
             println!("ERROR: Could not connect!");
             continue;
         };
-        a.write_all(b"YO").await;
-        loop{}
-        
+        a.write_all(b"YO").await.unwrap();
+        let (read_half, write_half) = a.into_split();
+
+        tokio::spawn(tcp_connection_receiver(read_half));
+        tokio::spawn(tcp_connection_writer(
+            write_half,
+            stdin_watch_receiver.clone(),
+        ));
     }
 }
 
@@ -80,6 +113,11 @@ async fn tcp_connection_listener(
     loop {
         let (stream, addr) = tcp.accept().await?;
         println!("got connection from: {:?}", addr);
+        if IN_CONNECTION.load(Ordering::Relaxed) {
+            println!("BUT already in connection");
+            continue;
+        }
+        IN_CONNECTION.store(true, Ordering::Relaxed);
 
         let (tcp_read, tcp_write) = stream.into_split();
 
@@ -90,6 +128,7 @@ async fn tcp_connection_listener(
         });
         tokio::spawn(async move {
             tcp_connection_receiver(tcp_read).await;
+            IN_CONNECTION.store(false, Ordering::Relaxed);
         });
     }
 }
@@ -116,7 +155,10 @@ async fn tcp_connection_receiver(mut read: tokio::net::tcp::OwnedReadHalf) {
     let mut stdout = tokio::io::stdout();
     loop {
         let mut buf = [0; 256];
-        let len = read.read(&mut buf).await.unwrap();
+        let Ok(len) = read.read(&mut buf).await else {
+            println!("exit tcplistener");
+            return;
+        };
         if len == 0 {
             println!("exit tcplistener");
             return;
@@ -135,7 +177,7 @@ async fn stdin_listener(
     loop {
         let mut buf = [0; 32];
         stdin.read(&mut buf).await?;
-        println!("you wrote: {:?}", buf);
+        // println!("you wrote: {:?}", buf);
         watch.send(buf)?;
     }
 }
