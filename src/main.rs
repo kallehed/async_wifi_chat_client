@@ -36,7 +36,13 @@ async fn get_new_stdin_msg() -> StdinMsg {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut name: StdinMsg = [0; 32];
-    name[0..5].copy_from_slice(b"kalle");
+    println!("Your name: ");
+    tokio::io::stdin().read(&mut name).await.unwrap();
+    for c in name.iter_mut() {
+        if *c == b'\n' {
+            *c = b'\0';
+        }
+    }
     tokio::spawn(broadcast_existance(name));
     let peers = Arc::new(Mutex::new(HashMap::new()));
     tokio::spawn(listen_for_peers(peers.clone(), name));
