@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::atomic::AtomicBool;
 use std::{sync::atomic::Ordering, time::Duration};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -15,7 +16,7 @@ type StdinMsg = [u8; 32];
 
 const LISTEN_SOCKET: (&str, u16) = (LISTEN_ADDRESS, PORT);
 
-static IN_CONNECTION: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static IN_CONNECTION: AtomicBool = AtomicBool::new(false);
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -134,19 +135,19 @@ async fn spawn_connection_from(
     IN_CONNECTION.store(true, Ordering::Relaxed);
     println!("CONNECTION CREATED!");
     let (read_half, write_half) = stream.into_split();
-    let atom = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let atom = Arc::new(AtomicBool::new(false));
     tokio::spawn(tcp_connection_receiver(read_half, atom.clone()));
     tokio::spawn(tcp_connection_writer(
         write_half,
         stdin_watch_receiver.clone(),
-        atom
+        atom,
     ));
 }
 
 async fn tcp_connection_writer(
     mut write: tokio::net::tcp::OwnedWriteHalf,
     mut stdin_watch_receiver: tokio::sync::watch::Receiver<StdinMsg>,
-    done: Arc<std::sync::atomic::AtomicBool>,
+    done: Arc<AtomicBool>,
 ) {
     loop {
         stdin_watch_receiver.changed().await.unwrap();
@@ -159,7 +160,7 @@ async fn tcp_connection_writer(
             write.shutdown().await.unwrap();
             break;
         }
-        if write.write_all(&my_buf).await.is_err() || done.load(Ordering::Relaxed)  {
+        if write.write_all(&my_buf).await.is_err() || done.load(Ordering::Relaxed) {
             break;
         }
     }
@@ -167,20 +168,25 @@ async fn tcp_connection_writer(
         done.store(true, Ordering::Relaxed);
         IN_CONNECTION.store(false, Ordering::Relaxed);
     }
-    println!("exit tcp sender");
+    // println!("exit tcp sender");
 }
 
 /// read from TcpListener and print to STDOUT
-async fn tcp_connection_receiver(mut read: tokio::net::tcp::OwnedReadHalf, done: Arc<std::sync::atomic::AtomicBool>) {
+async fn tcp_connection_receiver(
+    mut read: tokio::net::tcp::OwnedReadHalf,
+    done: Arc<AtomicBool>,
+) {
     let mut stdout = tokio::io::stdout();
     loop {
         let mut buf = [0; 256];
         let Ok(len) = read.read(&mut buf).await else {
-            println!("exit tcplistener");
-            IN_CONNECTION.store(false, Ordering::Relaxed);
             break;
         };
-        if len == 0 || done.load(Ordering::Relaxed) {
+        if len == 0 {
+            println!("PEER DISCONNECTED!");
+            break;
+        }
+        if done.load(Ordering::Relaxed) {
             break;
         }
         stdout.write_all(&buf).await.unwrap();
@@ -189,7 +195,7 @@ async fn tcp_connection_receiver(mut read: tokio::net::tcp::OwnedReadHalf, done:
         done.store(true, Ordering::Relaxed);
         IN_CONNECTION.store(false, Ordering::Relaxed);
     }
-    println!("exit tcplistener");
+    // println!("exit tcplistener");
 }
 
 async fn stdin_listener(
@@ -202,7 +208,6 @@ async fn stdin_listener(
     loop {
         let mut buf = [0; 32];
         stdin.read(&mut buf).await?;
-        // println!("you wrote: {:?}", buf);
         watch.send(buf)?;
     }
 }
