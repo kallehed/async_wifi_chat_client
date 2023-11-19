@@ -211,8 +211,9 @@ async fn listen_for_peers(peers: Arc<Mutex<HashSet<IpAddr>>>, name: StdinMsg) {
             // they have the same name as us
             continue;
         }
-        println!("got udp packet from: {:?} with name: ", peer);
+        print!("got udp packet from: {:?} with name: ", peer);
         tokio::io::stdout().write_all(&buf).await.unwrap();
+        println!();
         {
             let mut set = peers.lock().unwrap();
             set.insert(peer.ip());
