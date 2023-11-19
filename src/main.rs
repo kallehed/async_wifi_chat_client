@@ -123,7 +123,7 @@ async fn tcp_connection_listener() -> Result<(), Box<dyn std::error::Error>> {
     loop {
         let (mut stream, addr) = tcp.accept().await?;
         println!("got connection from: {:?}", addr);
-        let mut buf = [0;32];
+        let mut buf = [0; 32];
         stream.read(&mut buf).await.unwrap();
 
         spawn_connection_from(stream, buf).await;
@@ -169,7 +169,11 @@ async fn tcp_connection_writer(mut write: tokio::net::tcp::OwnedWriteHalf, done:
 }
 
 /// read from TcpListener and print to STDOUT
-async fn tcp_connection_receiver(mut read: tokio::net::tcp::OwnedReadHalf, done: Arc<AtomicBool>, peer_name: StdinMsg) {
+async fn tcp_connection_receiver(
+    mut read: tokio::net::tcp::OwnedReadHalf,
+    done: Arc<AtomicBool>,
+    peer_name: StdinMsg,
+) {
     let mut stdout = tokio::io::stdout();
     loop {
         let mut buf = [0; 256];
@@ -177,7 +181,9 @@ async fn tcp_connection_receiver(mut read: tokio::net::tcp::OwnedReadHalf, done:
             break;
         };
         if len == 0 {
-            println!("PEER DISCONNECTED!");
+            if !done.load(Ordering::Relaxed) {
+                println!("PEER DISCONNECTED!");
+            }
             break;
         }
         if done.load(Ordering::Relaxed) {
