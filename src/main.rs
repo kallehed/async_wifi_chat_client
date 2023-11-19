@@ -77,6 +77,7 @@ async fn tcp_connection_creator(
         stdin_watch_receiver.changed().await.unwrap();
         let num = {
             let inp = &*stdin_watch_receiver.borrow_and_update();
+            if IN_CONNECTION.load(Ordering::Relaxed) {continue}
             // turn u8's into utf8
             let len = inp
                 .iter()
