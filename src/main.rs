@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -22,7 +22,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut name: StdinMsg = [0; 32];
     name[0..5].copy_from_slice(b"kalle");
     tokio::spawn(broadcast_existance(name));
-    let peers = Arc::new(Mutex::new(HashSet::new()));
+    let peers = Arc::new(Mutex::new(HashMap::new()));
     tokio::spawn(listen_for_peers(peers.clone(), name));
     tokio::spawn(print_available_peers(peers.clone()));
 
@@ -43,7 +43,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     loop {}
 }
 
-async fn print_available_peers(peers: Arc<Mutex<HashSet<IpAddr>>>) {
+async fn print_available_peers(peers: Arc<Mutex<HashMap<IpAddr, StdinMsg>>>) {
     let mut interval = tokio::time::interval(Duration::from_millis(1500));
     loop {
         interval.tick().await;
@@ -55,17 +55,25 @@ async fn print_available_peers(peers: Arc<Mutex<HashSet<IpAddr>>>) {
         {
             let set = peers.lock().unwrap();
             for (idx, elem) in set.iter().enumerate() {
-                println!("  {}: {:?}", idx, elem);
+                print!("  {}: {:?}: ", idx, elem.0);
+                use std::io::Write;
+                std::io::stdout().write_all(elem.1).unwrap();
+                println!();
             }
         }
     }
 }
 
+// receives from STDIN and tries to create connections
 async fn tcp_connection_creator(
     mut stdin_watch_receiver: tokio::sync::watch::Receiver<StdinMsg>,
-    peers: Arc<Mutex<HashSet<IpAddr>>>,
+    peers: Arc<Mutex<HashMap<IpAddr, StdinMsg>>>,
 ) {
     loop {
+        if IN_CONNECTION.load(Ordering::Relaxed) {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            continue;
+        }
         stdin_watch_receiver.changed().await.unwrap();
         let num = {
             let inp = &*stdin_watch_receiver.borrow_and_update();
@@ -90,21 +98,13 @@ async fn tcp_connection_creator(
                 println!("ERROR: no such peer exists!");
                 continue;
             };
-            println!("{:?}", peer);
-            peer.clone()
+            *peer.clone().0
         };
-        let Ok(mut a) = tokio::net::TcpStream::connect((peer, PORT)).await else {
+        let Ok(tcp_stream) = tokio::net::TcpStream::connect((peer, PORT)).await else {
             println!("ERROR: Could not connect!");
             continue;
         };
-        a.write_all(b"YO").await.unwrap();
-        let (read_half, write_half) = a.into_split();
-
-        tokio::spawn(tcp_connection_receiver(read_half));
-        tokio::spawn(tcp_connection_writer(
-            write_half,
-            stdin_watch_receiver.clone(),
-        ));
+        spawn_connection_from(tcp_stream, stdin_watch_receiver.clone()).await;
     }
 }
 
@@ -115,24 +115,27 @@ async fn tcp_connection_listener(
     loop {
         let (stream, addr) = tcp.accept().await?;
         println!("got connection from: {:?}", addr);
-        if IN_CONNECTION.load(Ordering::Relaxed) {
-            println!("BUT already in connection");
-            continue;
-        }
-        IN_CONNECTION.store(true, Ordering::Relaxed);
 
-        let (tcp_read, tcp_write) = stream.into_split();
-
-        // read from stdin and send as tcp
-        let stdin_watch_receiver_clone = stdin_watch_receiver.clone();
-        tokio::spawn(async move {
-            tcp_connection_writer(tcp_write, stdin_watch_receiver_clone).await;
-        });
-        tokio::spawn(async move {
-            tcp_connection_receiver(tcp_read).await;
-            IN_CONNECTION.store(false, Ordering::Relaxed);
-        });
+        spawn_connection_from(stream, stdin_watch_receiver.clone()).await;
     }
+}
+
+async fn spawn_connection_from(
+    stream: tokio::net::TcpStream,
+    stdin_watch_receiver: tokio::sync::watch::Receiver<StdinMsg>,
+) {
+    if IN_CONNECTION.load(Ordering::Relaxed) {
+        println!("BUT already in connection");
+        return;
+    }
+    IN_CONNECTION.store(true, Ordering::Relaxed);
+    println!("CONNECTION CREATED!");
+    let (read_half, write_half) = stream.into_split();
+    tokio::spawn(tcp_connection_receiver(read_half));
+    tokio::spawn(tcp_connection_writer(
+        write_half,
+        stdin_watch_receiver.clone(),
+    ));
 }
 
 async fn tcp_connection_writer(
@@ -145,11 +148,17 @@ async fn tcp_connection_writer(
         stdin_watch_receiver
             .borrow_and_update()
             .clone_into(&mut my_buf);
+        if &my_buf[0..4] == b"exit" || &my_buf[0..4] == b"quit" {
+            println!("MANUALLY QUITING CONNECTION!");
+            write.shutdown().await.unwrap();
+            break;
+        }
         if write.write_all(&my_buf).await.is_err() {
-            println!("exit tcp sender");
-            return;
+            break;
         }
     }
+    IN_CONNECTION.store(false, Ordering::Relaxed);
+    println!("exit tcp sender");
 }
 
 /// read from TcpListener and print to STDOUT
@@ -159,14 +168,16 @@ async fn tcp_connection_receiver(mut read: tokio::net::tcp::OwnedReadHalf) {
         let mut buf = [0; 256];
         let Ok(len) = read.read(&mut buf).await else {
             println!("exit tcplistener");
-            return;
+            IN_CONNECTION.store(false, Ordering::Relaxed);
+            break;
         };
         if len == 0 {
-            println!("exit tcplistener");
-            return;
+            break;
         }
         stdout.write_all(&buf).await.unwrap();
     }
+    println!("exit tcplistener");
+    IN_CONNECTION.store(false, Ordering::Relaxed);
 }
 
 async fn stdin_listener(
@@ -190,16 +201,13 @@ async fn broadcast_existance(name: StdinMsg) {
     println!("broadcasting existance");
     loop {
         udp_sock
-            .send_to(
-                &name,
-                ("255.255.255.255", PORT as _),
-            )
+            .send_to(&name, ("255.255.255.255", PORT as _))
             .await
             .unwrap();
         tokio::time::sleep(Duration::from_millis(EXISTANCE_BROADCAST_MILLIS)).await;
     }
 }
-async fn listen_for_peers(peers: Arc<Mutex<HashSet<IpAddr>>>, name: StdinMsg) {
+async fn listen_for_peers(peers: Arc<Mutex<HashMap<IpAddr, StdinMsg>>>, name: StdinMsg) {
     let udp_sock = tokio::net::UdpSocket::bind(("0.0.0.0", PORT as _))
         .await
         .unwrap();
@@ -211,12 +219,15 @@ async fn listen_for_peers(peers: Arc<Mutex<HashSet<IpAddr>>>, name: StdinMsg) {
             // they have the same name as us
             continue;
         }
-        print!("got udp packet from: {:?} with name: ", peer);
-        tokio::io::stdout().write_all(&buf).await.unwrap();
-        println!();
-        {
+
+        if {
             let mut set = peers.lock().unwrap();
-            set.insert(peer.ip());
+            set.insert(peer.ip(), buf).is_none()
+        } {
+            // added a new person
+            print!("got new peer: {:?}, name:", peer);
+            tokio::io::stdout().write_all(&buf).await.unwrap();
+            tokio::io::stdout().write_all(b"\n").await.unwrap();
         }
     }
 }
