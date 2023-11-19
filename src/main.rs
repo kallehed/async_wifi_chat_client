@@ -9,7 +9,7 @@ use tokio::{
 };
 
 const PORT: u16 = 2000;
-const LISTEN_ADDRESS: &str = "127.0.0.1";
+const LISTEN_ADDRESS: &str = "0.0.0.0";
 const EXISTANCE_BROADCAST_MILLIS: u64 = 1500;
 type StdinMsg = [u8; 32];
 
@@ -19,9 +19,11 @@ static IN_CONNECTION: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicB
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    tokio::spawn(broadcast_existance());
+    let mut name: StdinMsg = [0; 32];
+    name[0..5].copy_from_slice(b"kalle");
+    tokio::spawn(broadcast_existance(name));
     let peers = Arc::new(Mutex::new(HashSet::new()));
-    tokio::spawn(listen_for_peers(peers.clone()));
+    tokio::spawn(listen_for_peers(peers.clone(), name));
     tokio::spawn(print_available_peers(peers.clone()));
 
     let (stdin_watch_sender, stdin_watch_receiver) = tokio::sync::watch::channel([0; 32]);
@@ -182,14 +184,14 @@ async fn stdin_listener(
     }
 }
 
-async fn broadcast_existance() {
+async fn broadcast_existance(name: StdinMsg) {
     let udp_sock = tokio::net::UdpSocket::bind(("0.0.0.0", 0)).await.unwrap();
     udp_sock.set_broadcast(true).unwrap();
     println!("broadcasting existance");
     loop {
         udp_sock
             .send_to(
-                b"YOLO OMEGA SWAG COOLIO MOORIO",
+                &name,
                 ("255.255.255.255", PORT as _),
             )
             .await
@@ -197,7 +199,7 @@ async fn broadcast_existance() {
         tokio::time::sleep(Duration::from_millis(EXISTANCE_BROADCAST_MILLIS)).await;
     }
 }
-async fn listen_for_peers(peers: Arc<Mutex<HashSet<IpAddr>>>) {
+async fn listen_for_peers(peers: Arc<Mutex<HashSet<IpAddr>>>, name: StdinMsg) {
     let udp_sock = tokio::net::UdpSocket::bind(("0.0.0.0", PORT as _))
         .await
         .unwrap();
@@ -205,7 +207,11 @@ async fn listen_for_peers(peers: Arc<Mutex<HashSet<IpAddr>>>) {
     println!("listening for peers");
     loop {
         let (_size, peer) = udp_sock.recv_from(&mut buf).await.unwrap();
-        println!("got udp packet from: {:?}", peer);
+        if name == buf {
+            // they have the same name as us
+            continue;
+        }
+        println!("got udp packet from: {:?} with name: ", peer);
         tokio::io::stdout().write_all(&buf).await.unwrap();
         {
             let mut set = peers.lock().unwrap();
