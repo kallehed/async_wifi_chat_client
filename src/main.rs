@@ -155,12 +155,15 @@ async fn tcp_connection_writer(
         stdin_watch_receiver
             .borrow_and_update()
             .clone_into(&mut my_buf);
+        if done.load(Ordering::Relaxed) {
+            break;
+        }
         if &my_buf[0..4] == b"exit" || &my_buf[0..4] == b"quit" {
             println!("MANUALLY QUITING CONNECTION!");
             write.shutdown().await.unwrap();
             break;
         }
-        if write.write_all(&my_buf).await.is_err() || done.load(Ordering::Relaxed) {
+        if write.write_all(&my_buf).await.is_err() {
             break;
         }
     }
